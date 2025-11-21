@@ -1,6 +1,7 @@
 import tilelang
 import tilelang.language as T
 import torch
+from tilelang.profiler import do_bench
 
 @tilelang.jit
 def baddmm(batch, M, N, K, block_M, block_N, block_K, dtype='float16', accum_dtype='float32'):
@@ -36,8 +37,8 @@ def baddmm(batch, M, N, K, block_M, block_N, block_K, dtype='float16', accum_dty
 
 
 if __name__ == "__main__":
-    batch, M, N, K = 8, 1024*4, 1024*2, 1024*2
-    block_M, block_N, block_K = 128, 128, 32
+    batch, M, N, K = 8, 1024*8, 1024, 1024
+    block_M, block_N, block_K = 128, 128, 64
 
     # Compile kernel (JIT compilation)
     matmul_relu_kernel = baddmm(batch, M, N, K, block_M, block_N, block_K)
@@ -62,21 +63,10 @@ if __name__ == "__main__":
     print("Kernel output matches PyTorch reference.")
 
     # Profile performance: compare TileLang kernel vs PyTorch native (cuBLAS)
-    def benchmark(fn, iters=100, warmup=10):
-        for _ in range(warmup):
-            fn()
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / iters  # ms per iteration
+    
 
-    tilelang_ms = benchmark(lambda: matmul_relu_kernel(a, b, c))
-    native_ms = benchmark(lambda: (a @ b) + a)
+    tilelang_ms = do_bench(lambda: matmul_relu_kernel(a, b, c))
+    native_ms = do_bench(lambda: (a @ b) + a)
 
     print(f"TileLang kernel avg latency: {tilelang_ms:.3f} ms")
     print(f"PyTorch native avg latency: {native_ms:.3f} ms")

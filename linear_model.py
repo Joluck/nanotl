@@ -2,6 +2,7 @@ import torch
 import tilelang
 import tilelang.language as T
 from einops import rearrange
+from tilelang.profiler import do_bench
 @tilelang.jit
 def linear_model(x, w, b):
     return x@w + b
@@ -29,59 +30,104 @@ def linear_model_naive(q, k, v, w):
     return o.transpose(1, 2).to(output_dtype)
 
 
-def linear_model_chunk(q, k, v, w, chunk_size=32):
-    B, T, H, D = q.shape
-    output_dtype = q.dtype  # 保存输出精度
-    num_chunks = T//chunk_size
-    
-    # 累积计算使用 float32 提高精度
-    q, k, v, w = map(lambda x: rearrange(x, 'b (n c) h d -> b h n c d', c=chunk_size).float(), (q, k, v, w))
-    
-    k = k.transpose(-1, -2)
-    inter_state = torch.zeros(B, H, num_chunks, D, D, device="cuda", dtype=torch.float32)
-    
-    # 计算跨 chunk 的累积状态
+
+def outer(q, k, v, num_chunks):
     outer_state = k@v  # [b,h,n,d,d]
     outer_s = torch.zeros_like(outer_state)
-    for n in range(num_chunks-1):
+    for n in range(num_chunks-1): #cumsum for outer_state
         outer_s[:,:,n+1] = outer_s[:,:,n] + outer_state[:,:,n]
-    outer_o = q@outer_s
-    
+    outer_o = q@outer_s  # [b,h,n,c,d]
+    return outer_o
+
+@tilelang.jit(out_idx=[3])
+def outer_kernel(B, S, H, DK, DV, dtype='float16', accum_dtype='float32'):
+
+    accum_dtype = 'float'
+
+    chunk_size = 64
+    BK = BV = 64  # Set to 128 can be faster, but has some numerical differences with FLA
+    assert S % chunk_size == 0 and DK % BK == 0 and DV % BV == 0
+    NK = tilelang.cdiv(DK, BK)
+    NV = tilelang.cdiv(DV, BV)
+    NT = tilelang.cdiv(S, chunk_size)
+
+    @T.prim_func
+    def kernel(
+        q: T.Tensor([B, S, H, DK], dtype),
+        k: T.Tensor([B, S, H, DK], dtype),
+        v: T.Tensor([B, S, H, DV], dtype),
+        O: T.Tensor([B, S, H, DV], accum_dtype),
+    ):
+        with T.Kernel(NV, NK, B * H) as (i_v, i_k, i_bh):
+
+            i_b = i_bh // H
+            i_h = i_bh % H
+            q_shared = T.alloc_shared([chunk_size, BK], dtype)
+            k_shared = T.alloc_shared([chunk_size, BK], dtype)
+            v_shared = T.alloc_shared([chunk_size, BV], dtype)
+            h = T.alloc_fragment([BK, BV], accum_dtype)
+            h_shared = T.alloc_shared([BK, BV], dtype)
+            o = T.alloc_fragment([chunk_size, BV], accum_dtype)
+            o_shared = T.alloc_shared([chunk_size, BV], accum_dtype)
+            for i in T.Pipelined(0, NT):
+                T.copy(q[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :], q_shared)
+                T.copy(k[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :], k_shared)
+                T.copy(v[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :], v_shared)
+                T.copy(h, h_shared)
+                T.gemm(k_shared, v_shared, h, transpose_A=True)
+                T.gemm(q_shared, h_shared, o)
+                T.copy(o, o_shared)
+                T.copy(o_shared, O[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :])
+    return kernel
+
+
+def inner(q, k, v, num_chunks, chunk_size, outer_o):
+    inter_state = torch.zeros(B, H, num_chunks, D, D, device="cuda", dtype=torch.float32)
+        
     # 计算 chunk 内的累积
     inter_o = torch.zeros_like(outer_o)
     for t in range(chunk_size):
         local_state = k[:,:,:,:,t:t+1]@v[:,:,:,t:t+1,:]
         inter_state += local_state
         inter_o[:,:,:,t:t+1,:] = q[:,:,:,t:t+1,:]@inter_state
+    return inter_o
+
+
+def linear_model_chunk(q, k, v, w, chunk_size=64):
+    B, S, H, D = q.shape
+    output_dtype = q.dtype  # 保存输出精度
+    num_chunks = S//chunk_size
+    
+    # 累积计算使用 float32 提高精度
+    outer_tl = outer_kernel(B, S, H, D, D, dtype='float16', accum_dtype='float32')
+    o1 = outer_tl(q, k, v)
+    o2 = outer(q, k, v, num_chunks)
+    torch.testing.assert_close(o1, o2.to(o1.dtype), rtol=1e-2, atol=1e-2)
+
+    print("11111111111111111111 ✓ 正确性验证通过！")
+
+    q, k, v, w = map(lambda x: rearrange(x, 'b (n c) h d -> b h n c d', c=chunk_size).float(), (q, k, v, w))
+    k = k.transpose(-1, -2)  
+
+    outer_o = outer(q, k, v, num_chunks)
+    
+    inter_o = inner(q, k, v, num_chunks, chunk_size, outer_o)
     
     # 合并并转回目标精度
     o = rearrange(inter_o + outer_o, 'b h n c d -> b (n c) h d').to(output_dtype)
     return o
 
-def benchmark(fn, iters=100, warmup=10):
-    """性能测试函数"""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters  # ms per iteration
 
 if __name__ == "__main__":
-    B, T, H, D = 8, 4096, 8, 64
-    dtype = torch.bfloat16
-    q = torch.randn(B, T, H, D, device="cuda", dtype=dtype)
-    k = torch.randn(B, T, H, D, device="cuda", dtype=dtype)
-    v = torch.randn(B, T, H, D, device="cuda", dtype=dtype)
-    w = torch.randn(B, T, D, D, device="cuda", dtype=dtype)
+    B, S, H, D = 2, 4096, 64, 64
+    dtype = torch.float16
+    q = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
+    k = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
+    v = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
+    w = torch.randn(B, S, D, D, device="cuda", dtype=dtype)
 
     print("=" * 60)
-    print(f"测试配置: B={B}, T={T}, H={H}, D={D}")
+    print(f"测试配置: B={B}, S={S}, H={H}, D={D}")
     print("=" * 60)
 
     # 正确性测试
@@ -93,8 +139,8 @@ if __name__ == "__main__":
 
     # 性能测试
     print("\n正在测速...")
-    naive_ms = benchmark(lambda: linear_model_naive(q.clone(), k.clone(), v.clone(), w.clone()))
-    chunk_ms = benchmark(lambda: linear_model_chunk(q.clone(), k.clone(), v.clone(), w.clone(), chunk_size=128))
+    naive_ms = do_bench(lambda: linear_model_naive(q.clone(), k.clone(), v.clone(), w.clone()))
+    chunk_ms = do_bench(lambda: linear_model_chunk(q.clone(), k.clone(), v.clone(), w.clone(), chunk_size=128))
 
     print(f"\n{'方法':<20} {'耗时 (ms)':<15} {'加速比':<10}")
     print("-" * 60)
