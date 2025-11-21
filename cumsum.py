@@ -24,14 +24,34 @@ def tl_cumsum(B, S, N, block_B, dtype='float16', accum_dtype='float32'):
                 T.copy(local_sum, y[bx, i, :])
     return forward
 
+@tilelang.jit(out_idx=[1])
+def tl_cumsum(B, S, N, block_B, dtype='float16', accum_dtype='float32'):
+    @T.prim_func
+    def forward(
+        x: T.Tensor([B, S, N], dtype),
+        y: T.Tensor([B, S, N], dtype),
+    ):
+        with T.Kernel(T.ceildiv(B, block_B)) as (bx,):
+            # x_shared = T.alloc_shared((block_B, N), dtype)
+            x_shared = T.alloc_fragment((block_B, N), dtype)
+            local_sum = T.alloc_fragment((block_B, N), accum_dtype)
+            T.clear(local_sum)
+            for i in T.Pipelined(0, S):
+                T.copy(x[bx*block_B:(bx+1)*block_B, i, :], x_shared)
+                for b, j in T.Parallel(block_B, N):  
+                    local_sum[b, j] += x_shared[b, j].astype(accum_dtype) 
+                T.copy(local_sum, y[bx*block_B:(bx+1)*block_B, i, :])
+    return forward
+
+
 # def naive_cumsum(x):
 #     for i in range(x.shape[0]-1):
 #         x[i+1, :] += x[i, :]
 #     return x
 
 if __name__ == "__main__":
-    B, S, N = 8, 1024, 1024
-    block_B = 128
+    B, S, N = 1, 1024, 1024
+    block_B = 1
     x = torch.randn(B, S, N, device="cuda", dtype=torch.float16)
     y = x.float().cumsum(dim=1).to(torch.float16)
 
