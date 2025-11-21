@@ -7,7 +7,7 @@ a = torch.randn(M, K, device="cuda", dtype=torch.float16)
 b = torch.randn(R, N, device="cuda", dtype=torch.float16)
 out = torch.sum(a.reshape(*a.shape[:-1], a.size(-1) // R, R), dim=-2)@b
 ```
-## tilelang 不对矩阵M进行分块，不考虑sm大小情况时
+## tilelang 不对M进行分块，不考虑sm大小情况时
 ```
 @tilelang.jit
 def shardshare(M, N, K, R, block_M, block_N, dtype='float16', accum_dtype='float32'):
@@ -84,7 +84,7 @@ def shardshare(M, N, K, R, block_M, block_N, dtype='float16', accum_dtype='float
 ```
 
 ## share memory显然放不下B_shared所以我们需要对N进行分块
-## 当K增大时显著变慢
+## K=128时 1.50x 但当K增大时显著变慢  
 ```
 @tilelang.jit
 def shardshare(M, N, K, R, block_M, block_N, dtype='float16', accum_dtype='float32'):
