@@ -1,4 +1,5 @@
-## MiSS
+## MiSS: Revisiting the Trade-off in LoRA with an Efficient Shard-Sharing Structure
+## [Paper](https://arxiv.org/abs/2409.15371)        [Github](https://github.com/Joluck/MiSS.git)
 ## torch
 ```
 M, K, N, R = 1024, 1024, 1024, 64
