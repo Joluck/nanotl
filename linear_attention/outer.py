@@ -77,7 +77,7 @@ def outer_cumsum(q, k, v, num_chunks, chunk_size=64):
     return rearrange(outer_o, 'b h n c d -> b (n c) h d'), h
 
 if __name__ == "__main__":
-    B, S, H, D = 8, 4096, 64, 64
+    B, S, H, D = 8, 512, 64, 64
     dtype = torch.float16
     q = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
     k = torch.randn(B, S, H, D, device="cuda", dtype=dtype)
