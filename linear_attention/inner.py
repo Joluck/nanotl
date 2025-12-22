@@ -17,19 +17,27 @@ def inner(q, k, v, num_chunks, chunk_size, outer_o=None):
         inter_o[:,:,:,t:t+1,:] = q[:,:,:,t:t+1,:]@inter_state
     return inter_o
 
-def inner_attn(q, k, v, num_chunks, chunk_size, outer_o):
-        
+def inner_attn(q, k, v, chunk_size, outer_o):
+    B, S, H, D = q.shape
+    output_dtype = q.dtype  # 保存输出精度
+    num_chunks = S//chunk_size
+
+    q, k, v = map(lambda x: rearrange(x, 'b (n c) h d -> b h n c d', c=chunk_size).float(), (q, k, v))
+    k = k.transpose(-1, -2)  
     qk = (q@k).masked_fill_(
         torch.triu(torch.ones(chunk_size, chunk_size, dtype=bool, device=q.device), diagonal=1),0)
     inter_o = qk@v
 
-    return inter_o
+    return rearrange(inter_o, 'b h n c d -> b (n c) h d')
 
 @tilelang.jit
 def inner_forward(B, S, H, DK, DV, dtype='float16', accum_dtype='float32'):
     chunk_size = 64
+    BK = BV = 64  # Set to 128 can be faster, but has some numerical differences with FLA
+    assert S % chunk_size == 0 and DK % BK == 0 and DV % BV == 0
+    NK = tilelang.cdiv(DK, BK)
+    NV = tilelang.cdiv(DV, BV)
     NT = tilelang.cdiv(S, chunk_size)
-
     @T.prim_func
     def kernel(
         q: T.Tensor([B, S, H, DK], dtype),
@@ -37,35 +45,31 @@ def inner_forward(B, S, H, DK, DV, dtype='float16', accum_dtype='float32'):
         v: T.Tensor([B, S, H, DV], dtype),
         O: T.Tensor([B, S, H, DV], accum_dtype),
     ):
-        with T.Kernel(B * H) as (i_bh):
+        with T.Kernel(B, H) as (i_b, i_h):
 
-            i_b = i_bh // H
-            i_h = i_bh % H
             q_shared = T.alloc_shared([chunk_size, DK], dtype)
             k_shared = T.alloc_shared([chunk_size, DK], dtype)
             v_shared = T.alloc_shared([chunk_size, DV], dtype)
-            h = T.alloc_fragment([DK, DV], accum_dtype)
-            h_shared = T.alloc_shared([DK, DV], dtype)
+            qk = T.alloc_fragment([DK, DV], accum_dtype)
+            qk_shared = T.alloc_shared([DK, DV], dtype)
             o = T.alloc_fragment([chunk_size, DV], accum_dtype)
+            T.clear(qk)
+
             for i in T.Pipelined(0, NT):
                 T.copy(q[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :], q_shared)
                 T.copy(k[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :], k_shared)
                 T.copy(v[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :], v_shared)
-                T.copy(h, h_shared)
-                T.gemm(k_shared, v_shared, h, transpose_A=True)
-                T.gemm(q_shared, h_shared, o)
-            T.clear(h)
-            T.clear(o)
+                T.gemm(q_shared, k_shared, qk, clear_accum=True, transpose_B=True)
 
-            
-
-            T.copy(o, O[i_b, i_n*chunk_size:(i_n+1)*chunk_size, i_h, :])
-        T.Kernel
+                for row, col in T.Parallel(chunk_size, chunk_size):
+                    qk_shared[row, col] = T.if_then_else(row >= col, qk[row, col], 0)
+                T.gemm(qk_shared, v_shared, o, clear_accum=True)
+                T.copy(o, O[i_b, i*chunk_size:(i+1)*chunk_size, i_h, :])
     return kernel
 
 if __name__ == "__main__":
-    B, S, H, D = 2, 2048, 64, 64
-    DK, DV = 32, 16
+    B, S, H, D = 2, 1024, 64, 64
+    DK, DV = 64, 64
     dtype = torch.float16
     q = torch.randn(B, S, H, DK, device="cuda", dtype=dtype)
     k = torch.randn(B, S, H, DK, device="cuda", dtype=dtype)
@@ -74,21 +78,16 @@ if __name__ == "__main__":
     state = torch.zeros(B, H, D, D, device="cuda", dtype=torch.float32)
     chunk_size=64
 
-    B, S, H, D = q.shape
-    output_dtype = q.dtype  # 保存输出精度
-    num_chunks = S//chunk_size
+    inner_kernel = inner_forward(B, S, H, DK, DV, dtype='float16', accum_dtype='float32')
+    outer_o = torch.zeros_like(q, dtype=torch.float32)
 
-    q, k, v = map(lambda x: rearrange(x, 'b (n c) h d -> b h n c d', c=chunk_size).float(), (q, k, v))
-    k = k.transpose(-1, -2)  
+    inner_kernel(q, k, v, outer_o)
+    print(outer_o.shape)
+    native_o = inner_attn(q, k, v, chunk_size, outer_o=None)
 
-    recurrent_intra_o = inner(q, k, v, num_chunks, chunk_size, outer_o=None)
-
-    attn_intra_o = inner_attn(q, k, v, num_chunks, chunk_size, outer_o=None)
-    print(recurrent_intra_o.shape, attn_intra_o.shape)
-
-    torch.testing.assert_close(recurrent_intra_o, attn_intra_o, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(native_o, outer_o, rtol=1e-2, atol=1e-2)
 
     native = do_bench(lambda: inner(q, k, v, num_chunks, chunk_size, outer_o=None))
     attn = do_bench(lambda: inner_attn(q, k, v, num_chunks, chunk_size, outer_o=None))
     print(native, attn)
-    print(f"Speedup (native / TileLang): {attn / native:.2f}x")
+    print(f"Speedup (native / TileLang): {native / attn:.2f}x")
